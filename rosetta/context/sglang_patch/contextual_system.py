@@ -1,9 +1,11 @@
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import hashlib
 import torch
 import uuid
 import asyncio
+import warnings
 
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.cache_utils import DynamicCache
@@ -103,6 +105,9 @@ class ContextualSystem:
         self._cached_len = {}  # uid -> current KV cache length (after drops)
         self._table_idx = {}  # uid -> allocated table index
 
+        # Session registry: SHA-256(first user content) -> uid
+        self._session_registry: Dict[str, str] = {}
+
         # Wait for scheduler to be ready
         print("Waiting for scheduler to be ready...")
         ready_msg = self.ready_queue.get()
@@ -137,6 +142,15 @@ class ContextualSystem:
     @staticmethod
     def hit_cache():
         pass
+
+    @staticmethod
+    def _session_key(messages: List[dict]) -> str:
+        """Derive a session key from the first user message's content via SHA-256."""
+        for msg in messages:
+            if msg.get("role") == "user":
+                content = msg.get("content") or ""
+                return hashlib.sha256(content.encode("utf-8")).hexdigest()
+        return str(uuid.uuid4())
     
     def _result_listener(self):
         while True:
@@ -163,8 +177,12 @@ class ContextualSystem:
                         self.token_cache[uid].append(msg.next_token)
 
                         if msg.finished:
+                            tokens = self.token_cache[uid]
+                            eos_id = self.tokenizer.eos_token_id
+                            if tokens and eos_id is not None and tokens[-1] != eos_id:
+                                tokens = tokens[:-1]
                             text = self.tokenizer.decode(
-                                self.token_cache[uid],
+                                tokens,
                                 skip_special_tokens=True,
                                 clean_up_tokenization_spaces=True
                             )
@@ -224,7 +242,8 @@ class ContextualSystem:
         all_input_ids: List[torch.Tensor] = []
         boundaries: List[Tuple[int, int, str, int]] = []
         current_messages: List[dict] = []
-        seq_len = 0
+        seq_len = 0           # actual token length (boundaries, includes <think>)
+        template_seq_len = 0  # chat-template view length (may strip <think>)
 
         eos_id = getattr(tokenizer, "eos_token_id", None)
 
@@ -241,20 +260,30 @@ class ContextualSystem:
                 enable_thinking=enable_thinking,
                 tools=tools,
             )
-            new_ids = full_no_gen[:, seq_len:]
+            # chat-template diff: slice based on template_seq_len
+            template_new_ids = full_no_gen[:, template_seq_len:]
 
             if role == "assistant":
                 if msg.get("tool_calls"):
+                    # tool_calls: use chat-template diff (unaffected by <think>)
+                    new_ids = template_new_ids
                     if eos_id is not None and new_ids.numel() > 0:
                         flat = new_ids[0]
                         eos_pos = (flat == int(eos_id)).nonzero(as_tuple=False)
                         if eos_pos.numel() > 0:
                             new_ids = new_ids[:, : int(eos_pos[0].item())]
                 else:
+                    # Non tool_calls assistant: tokenize content directly to preserve <think>
                     content = msg.get("content") or ""
                     new_ids = tokenizer(
                         content, return_tensors="pt", add_special_tokens=False
                     ).input_ids
+                # Advance template_seq_len by the chat-template's view
+                template_seq_len += int(template_new_ids.shape[1]) if template_new_ids.numel() > 0 else 0
+            else:
+                # Non-assistant: both seq_len tracks stay in sync
+                new_ids = template_new_ids
+                template_seq_len += int(new_ids.shape[1]) if new_ids.numel() > 0 else 0
 
             if new_ids.numel() > 0:
                 all_input_ids.append(new_ids)
@@ -277,10 +306,11 @@ class ContextualSystem:
                     enable_thinking=enable_thinking,
                     tools=tools,
                 )
-                gen_prompt_ids = full_with_gen[:, seq_len:]
+                gen_prompt_ids = full_with_gen[:, template_seq_len:]
                 if gen_prompt_ids.numel() > 0:
                     all_input_ids.append(gen_prompt_ids)
                     seq_len += int(gen_prompt_ids.shape[1])
+                    template_seq_len += int(gen_prompt_ids.shape[1])
 
             boundaries.append((start, seq_len, str(role), msg_id))
 
@@ -340,8 +370,8 @@ class ContextualSystem:
     
     async def generate_one_round(
         self,
-        uid: str,
-        messages: Union[str, List[Dict[str, str]]],
+        uid: Optional[str] = None,
+        messages: Union[str, List[Dict[str, str]]] = None,
         drop_messages: Optional[Dict[int, List[int]]] = None,
         max_new_tokens: int = 128,
         temperature: float = 0.0,
@@ -349,10 +379,11 @@ class ContextualSystem:
         top_k: int = -1,
         enable_thinking: bool = False,
         tools: Optional[List[Dict[str, Any]]] = None,
-        is_last_round: bool = False,
     ):
         if isinstance(messages, str):
             prompt = messages
+            if uid is None:
+                uid = str(uuid.uuid4())
             result = await self.generate_one_requests(
                 uid=uid,
                 messages=prompt,
@@ -364,17 +395,23 @@ class ContextualSystem:
             )
             return result
 
+        # Session identification: derive uid from SHA-256 of first user message
+        if uid is None:
+            session_key = self._session_key(messages)
+            if session_key in self._session_registry:
+                uid = self._session_registry[session_key]
+            else:
+                uid = str(uuid.uuid4())
+                self._session_registry[session_key] = uid
+
         # Initialize tracking for new conversations
         if uid not in self._next_position:
             self._next_position[uid] = 0
             self._cached_len[uid] = 0
             self._table_idx[uid] = None
 
-        prompt = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True, enable_thinking=enable_thinking
-        )
-
-        input_ids = self.tokenizer.encode(prompt, return_tensors="pt")
+        # Note: We no longer need the chat template output for input_ids
+        # as we use tokenize_conversation_round_by_round for proper <think> token handling
 
         not_gen_ids, boundaries = self.tokenize_conversation_round_by_round(
             messages,
@@ -383,8 +420,7 @@ class ContextualSystem:
             add_generation_prompt_last=False,
         )
 
-        # Calculate true_seq_len (absolute position including dropped messages)
-        self._next_position[uid] = boundaries[-1][1] if boundaries else self._next_position[uid]  # Default to self._next_position[uid] if no messages
+        # Use current _next_position as true_seq_len (don't overwrite it)
         true_seq_len = self._next_position[uid]
 
         sampling_params = SamplingParams(
@@ -419,7 +455,6 @@ class ContextualSystem:
             new_drop_ids=user_new_drop_ids,
             boundaries=boundaries,
             true_seq_len=true_seq_len,  # Absolute position
-            is_table_reuse=True,
         )
 
         # Mark to skip the prefill token
@@ -441,23 +476,34 @@ class ContextualSystem:
         if self._table_idx[uid] is None:
             self._table_idx[uid] = self.last_table_idx[uid]
 
-        # Update position tracking
+        # Update position tracking after user prefill
         # Calculate how many tokens are retained after drops
         retained_len = self._calculate_retained_len(boundaries, user_id, user_new_drop_ids)
         self._cached_len[uid] = retained_len
 
-        # Update next_position: add all tokens from current round (including those that will be dropped)
-        current_round_len = sum(end - start for start, end, _, msg_id in boundaries if msg_id >= user_id)
-        self._next_position[uid] = true_seq_len + current_round_len
+        # Update next_position: add the length of the current user message
+        if boundaries:
+            user_msg_len = boundaries[-1][1] - boundaries[-1][0]
+            self._next_position[uid] += user_msg_len
 
-        gen_len = len(input_ids.view(-1).to(torch.int32)) - len(not_gen_ids.view(-1).to(torch.int32))
+        # Calculate generation prompt tokens using tokenize_conversation_round_by_round
+        # This ensures <think> tokens are properly included
+        gen_prompt_ids, gen_boundaries = self.tokenize_conversation_round_by_round(
+            messages,
+            enable_thinking=enable_thinking,
+            tools=tools,
+            add_generation_prompt_last=True,
+        )
+
+        # Calculate generation prompt length
+        gen_len = gen_prompt_ids.shape[1] - not_gen_ids.shape[1]
         last_end = boundaries[-1][1] if boundaries else 0
         boundaries.append((last_end, last_end + gen_len, "assistant", assistant_id))
 
-        # Generate assistant response
+        # Generate assistant response using properly tokenized input with <think> tokens
         assistant_req = UserMsg(
             uid=uid,
-            input_ids=input_ids.view(-1).to(torch.int32),
+            input_ids=gen_prompt_ids.view(-1).to(torch.int32),  # Use tokenized version with <think>
             sampling_params=sampling_params,
             table_idx=self._table_idx[uid],  # Reuse same table
             message_id=assistant_id,
@@ -465,7 +511,6 @@ class ContextualSystem:
             new_drop_ids=assistant_new_drop_ids,
             boundaries=boundaries,
             true_seq_len=self._next_position[uid],  # Continue from current position
-            is_table_reuse=False if is_last_round else True,  # Only reuse table for non-last rounds to allow cache cleanup after generation
         )
 
         batch_msg = BatchBackendMsg(data=[assistant_req])
@@ -493,7 +538,12 @@ class ContextualSystem:
         enable_thinking: bool = False,
         tools: Optional[List[Dict[str, Any]]] = None,
     ):
-        """"""
+        """Deprecated: use generate_one_round with full message history instead."""
+        warnings.warn(
+            "generate_full_conversation is deprecated, use generate_one_round",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         uid = str(uuid.uuid4())
 
         name = example.get("name", "unnamed")
@@ -530,7 +580,6 @@ class ContextualSystem:
             new_drop_ids=self.get_drop_ids(0, drop_messages_config, new=True),
             boundaries=[],
             true_seq_len=0,
-            is_table_reuse=True if user_messages else False,  # If there are user messages, we will reuse the table for the first user message; otherwise, we can mark it as non-reuse to allow immediate cleanup
         )
 
         # Mark to skip the prefill token
@@ -561,7 +610,7 @@ class ContextualSystem:
             assistant_id = message_id + 1
             all_messages.append({"role": "user", "content": user_content})
             
-            # print(f"\n[Round {user_round}] User (ID={user_id}): {user_content}")
+            print(f"\n[Round {user_round}] User (ID={user_id}): {user_content}")
             
             # Append user message tokens with user_id (no generation prompt)
             response = await self.generate_one_round(
@@ -574,12 +623,11 @@ class ContextualSystem:
                 top_k=top_k,
                 enable_thinking=enable_thinking,
                 tools=tools,
-                is_last_round=(user_round == len(user_messages)),  # Only mark last round for non-reuse to allow cache cleanup after generation
             )
             
             all_messages.append({"role": "assistant", "content": response})
             
-            # print(f"Assistant (ID={assistant_id}): {response}")
+            print(f"Assistant (ID={assistant_id}): {response}")
             
             message_id += 1  # Ready for next user message
         
@@ -588,7 +636,6 @@ class ContextualSystem:
 
     async def generate_one_requests(
         self,
-        uid: str,
         messages: Union[str, List[Dict[str, str]]],
         max_new_tokens: int = 128,
         temperature: float = 0.0,
@@ -596,6 +643,7 @@ class ContextualSystem:
         top_k: int = -1,
         enable_thinking: bool = False,
     ):
+        uid = str(uuid.uuid4())
         
         if isinstance(messages, str):
             prompt = messages
@@ -652,15 +700,3 @@ class ContextualSystem:
             self.shutdown()
         except Exception:
             pass
-
-
-"""
-if __name__ == "__main__":
-    mp.set_start_method("spawn", force=True)
-    generator = ContextualSystem(
-        model_path="/share/public/public_models/Qwen3-1.7B",
-        dtype="bfloat16",
-        tp_size=1,
-        memory_ratio=0.9,
-    )
-"""
