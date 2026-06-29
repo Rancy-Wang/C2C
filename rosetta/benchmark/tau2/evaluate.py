@@ -197,6 +197,7 @@ def solve_task(
     domain: str,
     max_steps: int = 30,
     max_tool_rounds: int = 10,
+    drop_messages: Optional[Dict[int, List[int]]] = None,
     **rw_kwargs,
 ) -> Dict[str, Any]:
     """Run the agent loop for one tau2-bench task.
@@ -259,7 +260,8 @@ def solve_task(
     trajectory.append(user_msg)
 
     # 4. Agent loop
-    generate_fn = make_generate_fn(model)
+    # drop_messages is applied only to agent-side generation calls.
+    generate_fn = make_generate_fn(model, drop_message=drop_messages)
     termination = "max_steps"
     for step in range(max_steps):
         prev_len = len(messages)

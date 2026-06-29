@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import multiprocessing as mp
 import time
 from pathlib import Path
@@ -308,11 +309,14 @@ def run_judge(output_path: Path, args: argparse.Namespace) -> None:
             rec["llm0_messages"] = traj_map[eid]
 
     # Create judge model
+    judge_api_key = args.judge_api_key or os.getenv("JUDGE_API_KEY")
     judge_model = create_model(
         provider=args.judge_provider,
         model_type=args.judge_model_type,
         temperature=0.0,
         max_tokens=args.max_tokens,
+        model_url=args.judge_model_url,
+        api_key=judge_api_key,
     )
     judge = LLMJudge(judge_model, max_workers=args.num_workers)
 
@@ -412,6 +416,8 @@ def main() -> None:
     parser.add_argument("--judge-only", action="store_true", help="Only run judge")
     parser.add_argument("--judge-provider", default="fireworks")
     parser.add_argument("--judge-model-type", default="accounts/fireworks/models/qwen3-235b-a22b-instruct-2507")
+    parser.add_argument("--judge-model-url", default=None, help="API base URL for judge model (OpenAI-compatible endpoint, e.g. https://cloud.infini-ai.com/maas/v1)")
+    parser.add_argument("--judge-api-key", default=None, help="API key for judge model (falls back to JUDGE_API_KEY env var)")
 
     args = parser.parse_args()
 

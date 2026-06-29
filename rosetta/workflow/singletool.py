@@ -69,7 +69,11 @@ def run_with_tools(
     return completion.get("content", ""), messages
 
 
-def make_generate_fn(model, tracker: Optional[InteractionTracker] = None):
+def make_generate_fn(
+    model,
+    tracker: Optional[InteractionTracker] = None,
+    drop_message: Optional[Dict[int, List[int]]] = None,
+):
     """Build generate_fn from a CAMEL model backend.
 
     Args:
@@ -79,7 +83,7 @@ def make_generate_fn(model, tracker: Optional[InteractionTracker] = None):
     """
 
     def fn(msgs, tools):
-        response = model_run_sync(model, msgs, tools=tools)
+        response = model_run_sync(model, msgs, tools=tools, drop_message=drop_message)
         msg = response.choices[0].message
         reasoning = getattr(msg, "reasoning_content", None)
         d = msg_assistant(msg.content or "", tool_calls=msg.tool_calls, reasoning=reasoning)

@@ -5,6 +5,7 @@ import warnings
 from dataclasses import dataclass, field
 from typing import List, Optional, Any
 import json
+import copy
 from dotenv import load_dotenv, find_dotenv
 
 from camel.agents import ChatAgent
@@ -254,6 +255,7 @@ def _completions_stream_run(
         tokenizer_name: HuggingFace tokenizer name for chat template.
         messages: List of message dicts.
         tools: Optional list of tool schemas.
+        drop_message: Optional drop schedule for minisgl contextual system.
         temperature: Sampling temperature.
         max_tokens: Maximum tokens to generate.
         top_logprobs: Number of top logprob alternatives.
@@ -798,6 +800,7 @@ def model_run_sync(
     model: BaseModelBackend,
     messages: List[dict],
     tools: Optional[List[dict]] = None,
+    drop_message: Optional[dict[int, list[int]]] = None,
 ) -> ChatCompletion:
     """Run a model and return a complete ChatCompletion, handling streaming transparently.
 
@@ -832,7 +835,20 @@ def model_run_sync(
             top_logprobs=cc.get("top_logprobs", 5),
         )
 
-    response = model.run(messages, tools=tools)
+    # Inject per-request drop_message via extra_body for OpenAI-compatible backends.
+    # Keep the model object unchanged after each call.
+    old_cfg = getattr(model, "model_config_dict", None)
+    restore_cfg = old_cfg
+    if drop_message is not None and isinstance(old_cfg, dict):
+        cfg = copy.deepcopy(old_cfg)
+        extra_body = cfg.setdefault("extra_body", {})
+        extra_body["drop_message"] = {str(int(k)): [int(x) for x in v] for k, v in drop_message.items()}
+        model.model_config_dict = cfg
+    try:
+        response = model.run(messages, tools=tools)
+    finally:
+        if drop_message is not None and isinstance(old_cfg, dict):
+            model.model_config_dict = restore_cfg
 
     # Check if response is a stream (handles both openai.Stream and _SyncStreamWrapper)
     if isinstance(response, Stream):

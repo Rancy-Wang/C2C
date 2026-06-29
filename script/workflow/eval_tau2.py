@@ -30,6 +30,7 @@ import argparse
 import json
 import math
 import multiprocessing as mp
+import os
 import shutil
 import time
 from pathlib import Path
@@ -56,6 +57,72 @@ RETRYABLE_ERRORS = (
     "TimeoutError",
     "RateLimitError",
 )
+
+
+def _solve_task_once(
+    queue: mp.Queue,
+    model,
+    user_sim,
+    env,
+    task,
+    tools,
+    system_prompt: str,
+    domain: str,
+    max_steps: int,
+    drop_messages: dict[int, list[int]] | None,
+) -> None:
+    """Run solve_task in a child process and put result/error into queue."""
+    try:
+        from rosetta.benchmark.tau2.evaluate import solve_task
+
+        result = solve_task(
+            model=model,
+            user_sim=user_sim,
+            env=env,
+            task=task,
+            tools=tools,
+            system_prompt=system_prompt,
+            domain=domain,
+            max_steps=max_steps,
+            drop_messages=drop_messages,
+        )
+        queue.put(("ok", result))
+    except Exception as e:
+        queue.put(("err", f"{type(e).__name__}: {e}"))
+
+
+def _parse_drop_messages(raw: str | None) -> dict[int, list[int]] | None:
+    """Parse drop_messages JSON string into normalized int-key dict.
+
+    Expected CLI format:
+        '{"4":[2,3]}'
+    """
+    if not raw:
+        return None
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid --drop-messages JSON: {e}") from e
+
+    if not isinstance(obj, dict):
+        raise ValueError("--drop-messages must be a JSON object")
+
+    out: dict[int, list[int]] = {}
+    for k, v in obj.items():
+        key = int(k)
+        if not isinstance(v, list):
+            raise ValueError(f"--drop-messages[{k}] must be a list of message ids")
+        out[key] = [int(x) for x in v]
+    return out
+
+
+def _resolve_api_key(value: str | None, env_name: str | None) -> str | None:
+    """Resolve an API key from an explicit value or environment variable."""
+    if value:
+        return value
+    if env_name:
+        return os.getenv(env_name)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -143,9 +210,21 @@ def worker(
         )
 
     # --- Create user simulator model ---
+    # If not explicitly provided, let user model reuse agent model URL so
+    # local/openai-compatible setups work out of the box.
+    user_model_url = args.user_model_url or args.model_url
+    user_model_provider = (
+        "local" if args.user_model_provider == "api" else args.user_model_provider
+    )
+    user_model_api_key = _resolve_api_key(
+        args.user_model_api_key,
+        args.user_model_api_key_env,
+    )
     user_model = create_model(
-        provider=args.user_model_provider,
+        provider=user_model_provider,
         model_type=args.user_model_type,
+        model_url=user_model_url,
+        api_key=user_model_api_key,
         temperature=0.0,
         max_tokens=2048,
         chat_template_kwargs={"enable_thinking": False},
@@ -184,16 +263,44 @@ def worker(
                 sp = get_system_prompt(env)
                 user_sim.env = env
 
-                result = solve_task(
-                    model=agent_model,
-                    user_sim=user_sim,
-                    env=env,
-                    task=tasks[task_idx],
-                    tools=tools,
-                    system_prompt=sp,
-                    domain=args.domain,
-                    max_steps=args.max_steps,
+                q: mp.Queue = mp.Queue(maxsize=1)
+                p_eval = mp.Process(
+                    target=_solve_task_once,
+                    args=(
+                        q,
+                        agent_model,
+                        user_sim,
+                        env,
+                        tasks[task_idx],
+                        tools,
+                        sp,
+                        args.domain,
+                        args.max_steps,
+                        args.drop_messages,
+                    ),
                 )
+                p_eval.start()
+                p_eval.join(timeout=args.item_timeout_seconds)
+
+                if p_eval.is_alive():
+                    p_eval.terminate()
+                    p_eval.join(timeout=5)
+                    err = (
+                        f"ItemTimeoutError: solve_task exceeded "
+                        f"{args.item_timeout_seconds}s"
+                    )
+                else:
+                    if p_eval.exitcode == 0 and not q.empty():
+                        status, payload = q.get_nowait()
+                        if status == "ok":
+                            result = payload
+                        else:
+                            err = payload
+                    else:
+                        err = (
+                            f"WorkerProcessError: child exited with code "
+                            f"{p_eval.exitcode}"
+                        )
             except Exception as e:
                 err = f"{type(e).__name__}: {e}"
 
@@ -209,6 +316,7 @@ def worker(
                 "seconds": round(seconds, 2),
                 "error": err,
                 "no_thinking": args.no_thinking,
+                "drop_messages": args.drop_messages,
             }
             fout.write(json.dumps(record, ensure_ascii=False) + "\n")
             fout.flush()
@@ -222,6 +330,7 @@ def worker(
                 "task_id": task_idx,
                 "trial": trial,
                 "no_thinking": args.no_thinking,
+                "drop_messages": args.drop_messages,
                 "messages": saved_msgs,
                 "tools": tools_info,
             }
@@ -312,6 +421,8 @@ def write_summary(
         "--- Arguments ---",
     ]
     for k, v in vars(args).items():
+        if "api_key" in k:
+            v = "***" if v else None
         if isinstance(v, list):
             v = " ".join(str(x) for x in v)
         lines.append(f"  --{k.replace('_', '-')} {v}")
@@ -369,6 +480,26 @@ def main() -> None:
         "--user-model-type",
         default="accounts/fireworks/models/kimi-k2p5",
     )
+    parser.add_argument("--user-model-url", default=None,
+                        help="API base URL for local/compatible user simulator provider")
+    parser.add_argument(
+        "--user-model-api-key",
+        default=None,
+        help="API key for user simulator provider; prefer --user-model-api-key-env.",
+    )
+    parser.add_argument(
+        "--user-model-api-key-env",
+        default="USER_MODEL_API_KEY",
+        help="Environment variable that stores the user simulator API key.",
+    )
+
+    # Contextual drop (agent-side only)
+    parser.add_argument(
+        "--drop-messages",
+        default=None,
+        help="JSON dict mapping trigger message id to dropped message ids, "
+             "e.g. '{\"4\":[2,3]}'",
+    )
 
     # HF-specific
     parser.add_argument("--use-cache-opt", action="store_true",
@@ -388,8 +519,15 @@ def main() -> None:
 
     # Workers
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument(
+        "--item-timeout-seconds",
+        type=int,
+        default=600,
+        help="Per-item hard timeout in seconds. Exceeding this marks the item as failed.",
+    )
 
     args = parser.parse_args()
+    args.drop_messages = _parse_drop_messages(args.drop_messages)
 
     ALL_DOMAINS = ["airline", "retail"]
     domains = ALL_DOMAINS if args.domain == "all" else [args.domain]
